@@ -9,8 +9,8 @@ uvicorn==0.30.6
 
 # ── Base de datos ──
 sqlalchemy==2.0.35
-psycopg2-binary==2.9.9
-# psycopg2-binary → driver para PostgreSQL
+psycopg[binary]==3.2.4
+# psycopg → driver moderno para PostgreSQL (v3, funciona mejor en Railway)
 
 # ── Autenticación ──
 python-jose[cryptography]==3.3.0

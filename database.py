@@ -29,9 +29,11 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./nexotime.db")
 
 # Railway da la URL con "postgres://" pero SQLAlchemy necesita "postgresql://"
-# Esto lo corrige automáticamente:
+# Además, usamos psycopg (v3) como driver, así que la URL debe ser "postgresql+psycopg://"
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENGINE (Motor de la base de datos)
