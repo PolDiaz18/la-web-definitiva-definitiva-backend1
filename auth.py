@@ -26,7 +26,6 @@ from typing import Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -50,19 +49,19 @@ ACCESS_TOKEN_EXPIRE_DAYS = 30
 # ─────────────────────────────────────────────────────────────────────────────
 # bcrypt convierte "mi_contraseña" en algo como "$2b$12$LJ3m5..."
 # Es IRREVERSIBLE: no puedes obtener la contraseña original desde el hash.
-# Para verificar, hasheas la contraseña que envía el usuario y comparas los hashes.
+# Usamos bcrypt directamente (más fiable en producción que passlib).
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+import bcrypt
 
 
 def hash_password(password: str) -> str:
     """Convierte una contraseña en texto plano a un hash seguro"""
-    return pwd_context.hash(password)
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Compara una contraseña en texto plano con un hash almacenado"""
-    return pwd_context.verify(plain_password, hashed_password)
+    return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
