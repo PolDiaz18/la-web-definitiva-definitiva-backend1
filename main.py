@@ -25,12 +25,14 @@ Total: ~60 endpoints
 
 import os
 import logging
+import traceback
 from datetime import datetime, date, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi import FastAPI, Depends, HTTPException, status, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
 
@@ -56,6 +58,27 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s"
 )
 logger = logging.getLogger("nexotime.api")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INICIALIZACIÓN TEMPRANA DE LA BD
+# ─────────────────────────────────────────────────────────────────────────────
+# Creamos las tablas aquí, ANTES del lifespan, para asegurar que existan.
+# Esto es un respaldo por si el lifespan no se ejecuta correctamente.
+
+try:
+    init_db()
+    logger.info("✅ Base de datos inicializada (startup)")
+except Exception as e:
+    logger.error(f"❌ Error inicializando BD: {e}")
+
+try:
+    _db = SessionLocal()
+    seed_achievements(_db)
+    seed_quotes(_db)
+    _db.close()
+    logger.info("✅ Seeds completados (startup)")
+except Exception as e:
+    logger.error(f"❌ Error en seeds: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,6 +178,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL ERROR HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
+# Captura CUALQUIER error no manejado y devuelve un JSON con el error real
+# en vez de un genérico "Internal Server Error"
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Captura errores no manejados y devuelve detalles útiles"""
+    error_msg = str(exc)
+    error_trace = traceback.format_exc()
+    logger.error(f"❌ Error no manejado en {request.url}: {error_msg}\n{error_trace}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": error_msg,
+            "type": type(exc).__name__,
+            "path": str(request.url)
+        }
+    )
 
 
 # =============================================================================
