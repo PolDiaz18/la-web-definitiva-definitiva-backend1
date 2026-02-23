@@ -2,25 +2,9 @@
 =============================================================================
 BOT.PY — El Bot de Telegram de NexoTime v2
 =============================================================================
-Este bot es el "coach automatizado". No guarda datos por sí solo,
-todo lo lee/escribe directamente en la base de datos.
-
-¿Por qué acceso directo a BD y no por HTTP?
-  En v1 el bot llamaba a la API por HTTP. Pero como bot y API corren
-  en el MISMO proceso, es más rápido y fiable acceder directo a la BD.
-  No hay red de por medio → no hay latencia ni errores de conexión.
-
-Arquitectura:
-  Usuario → Telegram → Bot (este archivo) → Base de Datos ← API (main.py) ← Web
-
-Comandos implementados:
-  BÁSICOS:      /start, /help, /login
-  HÁBITOS:      /habitos, /pendiente, /hoy, /ayer
-  RUTINAS:      /morning, /night, /rutinas
-  PROGRESO:     /racha, /nivel, /logros, /semana, /calendario
-  TRACKEO:      /mood, /agua, /sueno, /nota
-  EXTRAS:       /pomodoro, /inspiracion, /tareas
-  CONFIG:       /pausar, /reanudar, /modo
+USA HTML en vez de MarkdownV2 para evitar errores de escape.
+MarkdownV2 es muy estricto con caracteres como - . ( ) !
+HTML es más fiable: <b>negrita</b>, <i>cursiva</i>
 """
 
 import os
@@ -28,7 +12,7 @@ import logging
 from datetime import datetime, date, timedelta
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton, BotCommand
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -39,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from database import SessionLocal
 from models import *
-from auth import hash_password, verify_password, create_access_token
+from auth import hash_password, verify_password
 from gamification import (
     award_xp, get_level_info, update_habit_streak, update_global_streak,
     check_and_unlock_achievements, get_random_quote, habit_applies_today,
@@ -47,1633 +31,674 @@ from gamification import (
 )
 
 logger = logging.getLogger("nexotime.bot")
-
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+HTML = ParseMode.HTML
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS (Funciones auxiliares)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Helpers ──
 
-def get_user_by_telegram(telegram_id: str, db: Session) -> User | None:
-    """Busca un usuario por su telegram_id"""
-    return db.query(User).filter(User.telegram_id == telegram_id).first()
+def get_user_by_telegram(tid, db):
+    return db.query(User).filter(User.telegram_id == tid).first()
 
+def require_user(tid, db):
+    u = get_user_by_telegram(tid, db)
+    if not u: raise ValueError("not_linked")
+    return u
 
-def require_user(telegram_id: str, db: Session) -> User:
-    """Como get_user_by_telegram pero lanza excepción si no existe"""
-    user = get_user_by_telegram(telegram_id, db)
-    if not user:
-        raise ValueError("not_linked")
-    return user
+NOT_LINKED = "❌ Su cuenta no está vinculada.\n\nUse /login para vincular su cuenta."
 
+def progress_bar(cur, tot, length=10):
+    if tot == 0: return "░" * length + " 0%"
+    f = int(length * cur / tot)
+    return "█" * f + "░" * (length - f) + f" {round(cur/tot*100)}%"
 
-NOT_LINKED_MSG = (
-    "❌ Su cuenta no está vinculada\\.\n\n"
-    "Use /login para vincular su cuenta de NexoTime\\."
-)
+def color_emoji(p):
+    if p >= 80: return "🟢"
+    if p >= 50: return "🟡"
+    return "🔴"
 
-def mood_emoji(level: int) -> str:
-    """Convierte nivel de mood a emoji"""
-    return {1: "😢", 2: "😞", 3: "😐", 4: "🙂", 5: "🤩"}.get(level, "😐")
+def mood_emoji(l):
+    return {1:"😢",2:"😞",3:"😐",4:"🙂",5:"🤩"}.get(l,"😐")
 
+def greeting():
+    h = datetime.now().hour
+    if h < 12: return "🌅 ¡Buenos días"
+    if h < 20: return "☀️ ¡Buenas tardes"
+    return "🌙 Buenas noches"
 
-def progress_bar(current: int, total: int, length: int = 10) -> str:
-    """Genera barra de progreso ASCII: ██████░░░░ 60%"""
-    if total == 0:
-        return "░" * length + " 0%"
-    filled = int(length * current / total)
-    bar = "█" * filled + "░" * (length - filled)
-    pct = round(current / total * 100)
-    return f"{bar} {pct}%"
+def motiv(s):
+    if s >= 30: return "Usted es imparable. 💎"
+    if s >= 14: return "¡Qué constancia! 🔥"
+    if s >= 7: return "¡Gran semana! 💪"
+    if s >= 3: return "Buen ritmo. 🌱"
+    return "Cada día cuenta. 🚀"
 
+async def reply(upd, text, kb=None):
+    await upd.message.reply_text(text, parse_mode=HTML, reply_markup=kb)
 
-def color_emoji(percentage: float) -> str:
-    """Emoji de color según porcentaje"""
-    if percentage >= 80:
-        return "🟢"
-    elif percentage >= 50:
-        return "🟡"
-    else:
-        return "🔴"
+async def edit(q, text, kb=None):
+    await q.edit_message_text(text, parse_mode=HTML, reply_markup=kb)
 
-
-def get_time_greeting() -> str:
-    """Saludo según la hora del día"""
-    hour = datetime.now().hour
-    if hour < 12:
-        return "🌅 ¡Buenos días"
-    elif hour < 20:
-        return "☀️ ¡Buenas tardes"
-    else:
-        return "🌙 Buenas noches"
+MAIN_KB = ReplyKeyboardMarkup(
+    [[KeyboardButton("📋 Hábitos"), KeyboardButton("📊 Hoy")],
+     [KeyboardButton("🌅 Morning"), KeyboardButton("🌙 Night")],
+     [KeyboardButton("💧 Agua"), KeyboardButton("💡 Inspiración")]],
+    resize_keyboard=True, is_persistent=True)
 
 
-def get_motivational_suffix(streak: int) -> str:
-    """Mensaje motivacional según racha"""
-    if streak >= 30:
-        return "Usted es imparable. 💎"
-    elif streak >= 14:
-        return "¡Qué constancia! Siga así. 🔥"
-    elif streak >= 7:
-        return "¡Gran semana! No afloje. 💪"
-    elif streak >= 3:
-        return "Buen ritmo, a por más. 🌱"
-    else:
-        return "Cada día cuenta. ¡Vamos! 🚀"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MENÚ PERSISTENTE
-# ─────────────────────────────────────────────────────────────────────────────
-# Este teclado aparece siempre en la parte inferior del chat.
-
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("📋 Hábitos"), KeyboardButton("📊 Hoy")],
-        [KeyboardButton("🌅 Morning"), KeyboardButton("🌙 Night")],
-        [KeyboardButton("💧 Agua"), KeyboardButton("💡 Inspiración")],
-    ],
-    resize_keyboard=True,
-    is_persistent=True
-)
-
-
-# =============================================================================
-# ===================== COMANDO: /start =======================================
-# =============================================================================
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Primer contacto con el bot"""
-    telegram_id = str(update.effective_user.id)
+# ── /start ──
+async def cmd_start(upd: Update, ctx):
+    tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        user = get_user_by_telegram(telegram_id, db)
-        
-        if user:
-            greeting = get_time_greeting()
-            await update.message.reply_text(
-                f"{greeting}, {user.name}\\! 🔷\n\n"
-                f"📊 Nivel {user.level} \\| {get_level_title(user.level)}\n"
-                f"🔥 Racha: {user.global_streak} días\n"
-                f"⚡ {user.xp} XP\n\n"
-                f"¿Qué desea hacer?",
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=MAIN_KEYBOARD
-            )
+        u = get_user_by_telegram(tid, db)
+        if u:
+            await reply(upd, f"{greeting()}, {u.name}! 🔷\n\n📊 Nivel {u.level} | {get_level_title(u.level)}\n🔥 Racha: {u.global_streak} días\n⚡ {u.xp} XP", MAIN_KB)
         else:
-            await update.message.reply_text(
-                "👋 ¡Bienvenido a *NexoTime*\\!\n\n"
-                "Soy su coach de productividad personal\\. "
-                "Le ayudaré a construir hábitos, seguir rutinas "
-                "y alcanzar sus objetivos\\.\n\n"
-                "Para empezar, vincule su cuenta:\n\n"
-                "1️⃣ Regístrese en la web de NexoTime\n"
-                "2️⃣ Use aquí: /login\n\n"
-                "Si ya tiene cuenta, escriba /login ahora\\.",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
-    finally:
-        db.close()
+            await reply(upd, "👋 ¡Bienvenido a <b>NexoTime</b>!\n\nSoy su coach de productividad.\n\n1️⃣ Regístrese en la web\n2️⃣ Use /login aquí")
+    finally: db.close()
 
 
-# =============================================================================
-# ===================== COMANDO: /login =======================================
-# =============================================================================
-# Flujo conversacional: pide email → pide contraseña → vincula
-
+# ── /login ──
 LOGIN_EMAIL, LOGIN_PASSWORD = range(2)
 
-async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia el flujo de login"""
-    telegram_id = str(update.effective_user.id)
+async def cmd_login(upd, ctx):
+    tid = str(upd.effective_user.id)
     db = SessionLocal()
     try:
-        user = get_user_by_telegram(telegram_id, db)
-        if user:
-            await update.message.reply_text(
-                f"✅ Ya tiene su cuenta vinculada, {user.name}\\.\n"
-                f"Use /help para ver los comandos disponibles\\.",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
+        u = get_user_by_telegram(tid, db)
+        if u:
+            await reply(upd, f"✅ Ya vinculado, {u.name}. Use /help")
             return ConversationHandler.END
-    finally:
-        db.close()
-    
-    await update.message.reply_text(
-        "🔐 *Vincular cuenta*\n\n"
-        "Escriba su email de NexoTime:",
-        parse_mode=ParseMode.MARKDOWN_V2
-    )
+    finally: db.close()
+    await reply(upd, "🔐 <b>Vincular cuenta</b>\n\nEscriba su email:")
     return LOGIN_EMAIL
 
-
-async def login_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe el email"""
-    context.user_data["login_email"] = update.message.text.strip()
-    await update.message.reply_text("Ahora escriba su contraseña:")
+async def login_email(upd, ctx):
+    ctx.user_data["login_email"] = upd.message.text.strip()
+    await reply(upd, "Escriba su contraseña:")
     return LOGIN_PASSWORD
 
-
-async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe la contraseña e intenta vincular"""
-    email = context.user_data.get("login_email", "")
-    password = update.message.text.strip()
-    telegram_id = str(update.effective_user.id)
-    
-    # Borrar mensaje con contraseña por seguridad
-    try:
-        await update.message.delete()
-    except:
-        pass
-    
+async def login_password(upd, ctx):
+    email = ctx.user_data.get("login_email", "")
+    pwd = upd.message.text.strip()
+    tid = str(upd.effective_user.id)
+    try: await upd.message.delete()
+    except: pass
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.email == email).first()
-        
-        if not user or not verify_password(password, user.password_hash):
-            await update.effective_chat.send_message(
-                "❌ Email o contraseña incorrectos\\. Intente de nuevo con /login",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
+        u = db.query(User).filter(User.email == email).first()
+        if not u or not verify_password(pwd, u.password_hash):
+            await upd.effective_chat.send_message("❌ Email o contraseña incorrectos. Intente /login")
             return ConversationHandler.END
-        
-        # Verificar que no esté vinculado a otro Telegram
-        existing = db.query(User).filter(
-            User.telegram_id == telegram_id, User.id != user.id
-        ).first()
-        if existing:
-            existing.telegram_id = None
-            db.commit()
-        
-        user.telegram_id = telegram_id
+        u.telegram_id = tid
         db.commit()
-        
-        await update.effective_chat.send_message(
-            f"✅ ¡Cuenta vinculada correctamente, {user.name}\\!\n\n"
-            f"🔷 *NexoTime está listo*\n\n"
-            f"Use /help para ver todos los comandos\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=MAIN_KEYBOARD
-        )
-        
-        logger.info(f"📱 Cuenta vinculada: {user.name} → tg:{telegram_id}")
-    finally:
-        db.close()
-    
+        await upd.effective_chat.send_message(f"✅ Cuenta vinculada, {u.name}!\n\n🔷 <b>NexoTime listo.</b> Use /help", parse_mode=HTML, reply_markup=MAIN_KB)
+    finally: db.close()
+    return ConversationHandler.END
+
+async def login_cancel(upd, ctx):
+    await reply(upd, "Cancelado.")
     return ConversationHandler.END
 
 
-async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancela el flujo de login"""
-    await update.message.reply_text("Login cancelado\\.", parse_mode=ParseMode.MARKDOWN_V2)
-    return ConversationHandler.END
+# ── /help ──
+async def cmd_help(upd, ctx):
+    await reply(upd,
+        "📖 <b>Comandos</b>\n\n"
+        "<b>Hábitos:</b>\n/habitos /pendiente /hoy /ayer\n\n"
+        "<b>Rutinas:</b>\n/morning /night /rutinas\n\n"
+        "<b>Progreso:</b>\n/racha /nivel /logros /semana /calendario\n\n"
+        "<b>Trackeo:</b>\n/mood /agua /sueno /nota\n\n"
+        "<b>Extras:</b>\n/pomodoro /inspiracion /tareas\n\n"
+        "<b>Config:</b>\n/pausar /reanudar /modo")
 
 
-# =============================================================================
-# ===================== COMANDO: /help ========================================
-# =============================================================================
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *Comandos de NexoTime*\n\n"
-        "*Hábitos:*\n"
-        "  /habitos — Ver y marcar hábitos del día\n"
-        "  /pendiente — Solo los que faltan\n"
-        "  /hoy — Resumen rápido del día\n"
-        "  /ayer — Cómo fue ayer\n\n"
-        "*Rutinas:*\n"
-        "  /morning — Rutina de mañana\n"
-        "  /night — Rutina de noche\n"
-        "  /rutinas — Todas sus rutinas\n\n"
-        "*Progreso:*\n"
-        "  /racha — Sus rachas actuales\n"
-        "  /nivel — XP y nivel\n"
-        "  /logros — Insignias desbloqueadas\n"
-        "  /semana — Resumen semanal\n"
-        "  /calendario — Mapa de calor del mes\n\n"
-        "*Trackeo rápido:*\n"
-        "  /mood — Registrar estado de ánimo\n"
-        "  /agua — Sumar un vaso de agua\n"
-        "  /sueno — Registrar horas de sueño\n"
-        "  /nota — Escribir en el diario\n\n"
-        "*Extras:*\n"
-        "  /pomodoro — Timer de productividad\n"
-        "  /inspiracion — Cita motivacional\n"
-        "  /tareas — Tareas pendientes\n\n"
-        "*Configuración:*\n"
-        "  /pausar — Pausar recordatorios\n"
-        "  /reanudar — Reactivar recordatorios\n"
-        "  /modo — Cambiar modo \\(normal/vacaciones/enfermo\\)",
-        parse_mode=ParseMode.MARKDOWN_V2
-    )
-
-
-# =============================================================================
-# ===================== COMANDO: /habitos =====================================
-# =============================================================================
-
-async def cmd_habitos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra los hábitos del día con botones ✅/❌"""
-    telegram_id = str(update.effective_user.id)
+# ── /habitos ──
+async def cmd_habitos(upd, ctx):
+    tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        user = require_user(telegram_id, db)
+        u = require_user(tid, db)
         today = date.today()
-        
-        habits = db.query(Habit).filter(
-            Habit.user_id == user.id, Habit.active == True, Habit.archived == False
-        ).order_by(Habit.order).all()
-        
+        habits = db.query(Habit).filter(Habit.user_id==u.id, Habit.active==True, Habit.archived==False).order_by(Habit.order).all()
         if not habits:
-            await update.message.reply_text(
-                "No tiene hábitos configurados\\.\n"
-                "Añádalos desde la web de NexoTime\\.",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
-            return
-        
-        # Filtrar hábitos que aplican hoy
+            await reply(upd, "No tiene hábitos. Añádalos desde la web."); return
         applicable = [h for h in habits if habit_applies_today(h, today)]
-        
         if not applicable:
-            await update.message.reply_text(
-                "Hoy no tiene hábitos programados\\. ¡Día libre\\! 🎉",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
-            return
-        
-        # Obtener logs de hoy
-        logs = db.query(HabitLog).filter(
-            HabitLog.user_id == user.id, HabitLog.date == today
-        ).all()
-        log_map = {l.habit_id: l for l in logs}
-        
-        # Construir mensaje y botones
-        completed = sum(1 for h in applicable if log_map.get(h.id) and log_map[h.id].completed)
-        total = len(applicable)
-        pct = round(completed / total * 100) if total > 0 else 0
-        
-        lines = [f"📋 *Hábitos de hoy* {color_emoji(pct)}\n"]
-        lines.append(f"{progress_bar(completed, total)}\n")
-        
-        keyboard = []
-        for habit in applicable:
-            log = log_map.get(habit.id)
-            done = log and log.completed
-            status = "✅" if done else "⬜"
-            
-            lines.append(f"{status} {habit.icon} {habit.name}")
-            
-            if habit.habit_type == "quantity" and habit.target_quantity:
-                current = log.quantity_logged if log else 0
-                lines[-1] += f" \\({int(current)}/{int(habit.target_quantity)} {habit.quantity_unit or ''}\\)"
-            
-            # Botones
-            if done:
-                keyboard.append([InlineKeyboardButton(
-                    f"↩️ Desmarcar {habit.name}",
-                    callback_data=f"habit_undo_{habit.id}"
-                )])
-            else:
-                if habit.habit_type == "quantity":
-                    keyboard.append([
-                        InlineKeyboardButton(
-                            f"➕ {habit.icon} +1",
-                            callback_data=f"habit_qty_{habit.id}"
-                        ),
-                        InlineKeyboardButton(
-                            f"✅ Completar",
-                            callback_data=f"habit_do_{habit.id}"
-                        )
-                    ])
-                else:
-                    keyboard.append([InlineKeyboardButton(
-                        f"✅ {habit.icon} {habit.name}",
-                        callback_data=f"habit_do_{habit.id}"
-                    )])
-        
-        if completed == total and total > 0:
-            lines.append(f"\n🎉 *¡Todos completados\\!* {get_motivational_suffix(user.global_streak)}")
-        
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
-        )
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
-
-
-# =============================================================================
-# ===================== CALLBACK: Marcar/Desmarcar hábitos ====================
-# =============================================================================
-
-async def callback_habit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja los botones de hábitos"""
-    query = update.callback_query
-    await query.answer()
-    
-    telegram_id = str(update.effective_user.id)
-    data = query.data
-    
-    db = SessionLocal()
-    try:
-        user = require_user(telegram_id, db)
-        today = date.today()
-        
-        if data.startswith("habit_do_"):
-            habit_id = int(data.replace("habit_do_", ""))
-            _mark_habit(db, user, habit_id, today, completed=True)
-        
-        elif data.startswith("habit_undo_"):
-            habit_id = int(data.replace("habit_undo_", ""))
-            _mark_habit(db, user, habit_id, today, completed=False)
-        
-        elif data.startswith("habit_qty_"):
-            habit_id = int(data.replace("habit_qty_", ""))
-            _increment_habit_quantity(db, user, habit_id, today)
-        
-        # Regenerar el mensaje de hábitos (editar in-place)
-        habits = db.query(Habit).filter(
-            Habit.user_id == user.id, Habit.active == True, Habit.archived == False
-        ).order_by(Habit.order).all()
-        
-        applicable = [h for h in habits if habit_applies_today(h, today)]
-        logs = db.query(HabitLog).filter(
-            HabitLog.user_id == user.id, HabitLog.date == today
-        ).all()
-        log_map = {l.habit_id: l for l in logs}
-        
-        completed = sum(1 for h in applicable if log_map.get(h.id) and log_map[h.id].completed)
-        total = len(applicable)
-        pct = round(completed / total * 100) if total > 0 else 0
-        
-        lines = [f"📋 *Hábitos de hoy* {color_emoji(pct)}\n"]
-        lines.append(f"{progress_bar(completed, total)}\n")
-        
-        keyboard = []
-        for habit in applicable:
-            log = log_map.get(habit.id)
-            done = log and log.completed
-            status = "✅" if done else "⬜"
-            
-            line = f"{status} {habit.icon} {habit.name}"
-            if habit.habit_type == "quantity" and habit.target_quantity:
-                current = log.quantity_logged if log else 0
-                line += f" \\({int(current)}/{int(habit.target_quantity)} {habit.quantity_unit or ''}\\)"
+            await reply(upd, "Hoy no tiene hábitos programados. 🎉"); return
+        logs = db.query(HabitLog).filter(HabitLog.user_id==u.id, HabitLog.date==today).all()
+        lm = {l.habit_id: l for l in logs}
+        done = sum(1 for h in applicable if lm.get(h.id) and lm[h.id].completed)
+        tot = len(applicable)
+        pct = round(done/tot*100) if tot else 0
+        lines = [f"📋 <b>Hábitos de hoy</b> {color_emoji(pct)}\n", progress_bar(done,tot)+"\n"]
+        kb = []
+        for h in applicable:
+            lg = lm.get(h.id)
+            d = lg and lg.completed
+            st = "✅" if d else "⬜"
+            line = f"{st} {h.icon} {h.name}"
+            if h.habit_type=="quantity" and h.target_quantity:
+                c = lg.quantity_logged if lg else 0
+                line += f" ({int(c)}/{int(h.target_quantity)} {h.quantity_unit or ''})"
             lines.append(line)
-            
-            if done:
-                keyboard.append([InlineKeyboardButton(
-                    f"↩️ Desmarcar {habit.name}",
-                    callback_data=f"habit_undo_{habit.id}"
-                )])
+            if d:
+                kb.append([InlineKeyboardButton(f"↩️ {h.name}", callback_data=f"habit_undo_{h.id}")])
+            elif h.habit_type=="quantity":
+                kb.append([InlineKeyboardButton(f"➕ +1", callback_data=f"habit_qty_{h.id}"), InlineKeyboardButton("✅", callback_data=f"habit_do_{h.id}")])
             else:
-                if habit.habit_type == "quantity":
-                    keyboard.append([
-                        InlineKeyboardButton(f"➕ {habit.icon} +1", callback_data=f"habit_qty_{habit.id}"),
-                        InlineKeyboardButton(f"✅ Completar", callback_data=f"habit_do_{habit.id}")
-                    ])
-                else:
-                    keyboard.append([InlineKeyboardButton(
-                        f"✅ {habit.icon} {habit.name}", callback_data=f"habit_do_{habit.id}"
-                    )])
-        
-        if completed == total and total > 0:
-            lines.append(f"\n🎉 *¡Todos completados\\!* {get_motivational_suffix(user.global_streak)}")
-        
-        # Verificar nuevos logros
-        new_achievements = check_and_unlock_achievements(db, user)
-        for ach in new_achievements:
-            lines.append(f"\n🏆 *¡Logro desbloqueado\\!* {ach.icon} {ach.name}")
-        
-        await query.edit_message_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
-        )
-    
-    except ValueError:
-        await query.edit_message_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+                kb.append([InlineKeyboardButton(f"✅ {h.icon} {h.name}", callback_data=f"habit_do_{h.id}")])
+        if done==tot and tot>0:
+            lines.append(f"\n🎉 <b>¡Todos completados!</b> {motiv(u.global_streak)}")
+        await reply(upd, "\n".join(lines), InlineKeyboardMarkup(kb) if kb else None)
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
 
 
-def _mark_habit(db: Session, user: User, habit_id: int, today: date, completed: bool):
-    """Marca o desmarca un hábito"""
-    habit = db.query(Habit).filter(Habit.id == habit_id, Habit.user_id == user.id).first()
-    if not habit:
-        return
-    
-    log = db.query(HabitLog).filter(
-        HabitLog.habit_id == habit_id, HabitLog.date == today
-    ).first()
-    
-    if log:
-        log.completed = completed
-        log.completed_at = datetime.utcnow() if completed else None
-    else:
-        log = HabitLog(
-            user_id=user.id, habit_id=habit_id, date=today,
-            completed=completed, completed_at=datetime.utcnow() if completed else None
-        )
-        db.add(log)
-    
-    db.commit()
-    
-    if completed:
-        update_habit_streak(db, habit, True, today)
-        update_global_streak(db, user, today)
-        award_xp(db, user, "habit_complete", habit.current_streak)
-    else:
-        update_habit_streak(db, habit, False, today)
-
-
-def _increment_habit_quantity(db: Session, user: User, habit_id: int, today: date):
-    """Incrementa la cantidad de un hábito (+1)"""
-    habit = db.query(Habit).filter(Habit.id == habit_id, Habit.user_id == user.id).first()
-    if not habit:
-        return
-    
-    log = db.query(HabitLog).filter(
-        HabitLog.habit_id == habit_id, HabitLog.date == today
-    ).first()
-    
-    if log:
-        log.quantity_logged += 1
-        if habit.target_quantity and log.quantity_logged >= habit.target_quantity:
-            log.completed = True
-            log.completed_at = datetime.utcnow()
-    else:
-        is_complete = habit.target_quantity and 1 >= habit.target_quantity
-        log = HabitLog(
-            user_id=user.id, habit_id=habit_id, date=today,
-            quantity_logged=1, completed=is_complete,
-            completed_at=datetime.utcnow() if is_complete else None
-        )
-        db.add(log)
-    
-    db.commit()
-    
-    if log.completed:
-        update_habit_streak(db, habit, True, today)
-        update_global_streak(db, user, today)
-        award_xp(db, user, "habit_complete", habit.current_streak)
-
-
-# =============================================================================
-# ===================== COMANDO: /pendiente ===================================
-# =============================================================================
-
-async def cmd_pendiente(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra solo los hábitos NO completados de hoy"""
-    telegram_id = str(update.effective_user.id)
+# ── Callback hábitos ──
+async def callback_habit(upd, ctx):
+    q = upd.callback_query
+    await q.answer()
+    tid = str(upd.effective_user.id)
+    data = q.data
     db = SessionLocal()
-    
     try:
-        user = require_user(telegram_id, db)
+        u = require_user(tid, db)
         today = date.today()
-        
-        habits = db.query(Habit).filter(
-            Habit.user_id == user.id, Habit.active == True, Habit.archived == False
-        ).order_by(Habit.order).all()
-        
+        if data.startswith("habit_do_"): _mark(db, u, int(data[9:]), today, True)
+        elif data.startswith("habit_undo_"): _mark(db, u, int(data[11:]), today, False)
+        elif data.startswith("habit_qty_"): _incr(db, u, int(data[10:]), today)
+
+        habits = db.query(Habit).filter(Habit.user_id==u.id, Habit.active==True, Habit.archived==False).order_by(Habit.order).all()
         applicable = [h for h in habits if habit_applies_today(h, today)]
-        logs = db.query(HabitLog).filter(
-            HabitLog.user_id == user.id, HabitLog.date == today, HabitLog.completed == True
-        ).all()
-        completed_ids = {l.habit_id for l in logs}
-        
-        pending = [h for h in applicable if h.id not in completed_ids]
-        
-        if not pending:
-            await update.message.reply_text(
-                "✅ *¡No tiene nada pendiente\\!*\n\n"
-                f"Ha completado todo hoy\\. {get_motivational_suffix(user.global_streak)}",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
-            return
-        
-        lines = [f"⏳ *Hábitos pendientes* \\({len(pending)} restantes\\)\n"]
-        keyboard = []
-        
-        for habit in pending:
-            lines.append(f"⬜ {habit.icon} {habit.name}")
-            keyboard.append([InlineKeyboardButton(
-                f"✅ {habit.icon} {habit.name}",
-                callback_data=f"habit_do_{habit.id}"
-            )])
-        
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+        logs = db.query(HabitLog).filter(HabitLog.user_id==u.id, HabitLog.date==today).all()
+        lm = {l.habit_id: l for l in logs}
+        done = sum(1 for h in applicable if lm.get(h.id) and lm[h.id].completed)
+        tot = len(applicable)
+        pct = round(done/tot*100) if tot else 0
+        lines = [f"📋 <b>Hábitos de hoy</b> {color_emoji(pct)}\n", progress_bar(done,tot)+"\n"]
+        kb = []
+        for h in applicable:
+            lg = lm.get(h.id)
+            d = lg and lg.completed
+            st = "✅" if d else "⬜"
+            line = f"{st} {h.icon} {h.name}"
+            if h.habit_type=="quantity" and h.target_quantity:
+                c = lg.quantity_logged if lg else 0
+                line += f" ({int(c)}/{int(h.target_quantity)} {h.quantity_unit or ''})"
+            lines.append(line)
+            if d: kb.append([InlineKeyboardButton(f"↩️ {h.name}", callback_data=f"habit_undo_{h.id}")])
+            elif h.habit_type=="quantity": kb.append([InlineKeyboardButton("➕ +1", callback_data=f"habit_qty_{h.id}"), InlineKeyboardButton("✅", callback_data=f"habit_do_{h.id}")])
+            else: kb.append([InlineKeyboardButton(f"✅ {h.icon} {h.name}", callback_data=f"habit_do_{h.id}")])
+        if done==tot and tot>0: lines.append(f"\n🎉 <b>¡Todos completados!</b> {motiv(u.global_streak)}")
+        achs = check_and_unlock_achievements(db, u)
+        for a in achs: lines.append(f"\n🏆 <b>Logro:</b> {a.icon} {a.name}")
+        await edit(q, "\n".join(lines), InlineKeyboardMarkup(kb) if kb else None)
+    except ValueError: await edit(q, NOT_LINKED)
+    finally: db.close()
 
+def _mark(db, u, hid, today, done):
+    h = db.query(Habit).filter(Habit.id==hid, Habit.user_id==u.id).first()
+    if not h: return
+    lg = db.query(HabitLog).filter(HabitLog.habit_id==hid, HabitLog.date==today).first()
+    if lg: lg.completed=done; lg.completed_at=datetime.utcnow() if done else None
+    else: lg=HabitLog(user_id=u.id,habit_id=hid,date=today,completed=done,completed_at=datetime.utcnow() if done else None); db.add(lg)
+    db.commit()
+    if done: update_habit_streak(db,h,True,today); update_global_streak(db,u,today); award_xp(db,u,"habit_complete",h.current_streak)
+    else: update_habit_streak(db,h,False,today)
 
-# =============================================================================
-# ===================== COMANDO: /hoy ========================================
-# =============================================================================
-
-async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Resumen rápido del día"""
-    telegram_id = str(update.effective_user.id)
-    db = SessionLocal()
-    
-    try:
-        user = require_user(telegram_id, db)
-        today = date.today()
-        
-        # Hábitos
-        habits = db.query(Habit).filter(
-            Habit.user_id == user.id, Habit.active == True, Habit.archived == False
-        ).all()
-        applicable = [h for h in habits if habit_applies_today(h, today)]
-        logs = db.query(HabitLog).filter(
-            HabitLog.user_id == user.id, HabitLog.date == today, HabitLog.completed == True
-        ).all()
-        h_completed = len(logs)
-        h_total = len(applicable)
-        h_pct = round(h_completed / h_total * 100) if h_total > 0 else 0
-        
-        # Agua
-        water = db.query(WaterLog).filter(
-            WaterLog.user_id == user.id, WaterLog.date == today
-        ).first()
-        water_glasses = water.glasses if water else 0
-        water_target = water.target if water else 8
-        
-        # Mood
-        mood = db.query(MoodLog).filter(
-            MoodLog.user_id == user.id, MoodLog.date == today
-        ).first()
-        
-        # Tareas pendientes
-        pending_tasks = db.query(Task).filter(
-            Task.user_id == user.id, Task.completed == False
-        ).count()
-        
-        # Pomodoros
-        pomodoros = db.query(PomodoroSession).filter(
-            PomodoroSession.user_id == user.id,
-            PomodoroSession.date == today,
-            PomodoroSession.completed == True
-        ).count()
-        
-        greeting = get_time_greeting()
-        
-        lines = [
-            f"{greeting}\\! 📊\n",
-            f"*Hábitos:* {h_completed}/{h_total} {color_emoji(h_pct)}",
-            f"{progress_bar(h_completed, h_total)}",
-            f"\n💧 *Agua:* {water_glasses}/{water_target} vasos",
-        ]
-        
-        if mood:
-            lines.append(f"😊 *Ánimo:* {mood_emoji(mood.level)} \\({mood.level}/5\\)")
-        
-        if pomodoros > 0:
-            lines.append(f"🍅 *Pomodoros:* {pomodoros}")
-        
-        if pending_tasks > 0:
-            lines.append(f"📝 *Tareas pendientes:* {pending_tasks}")
-        
-        lines.append(f"\n🔥 *Racha:* {user.global_streak} días")
-        lines.append(f"⚡ *Nivel:* {user.level} \\({get_level_title(user.level)}\\)")
-        
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
-
-
-# =============================================================================
-# ===================== COMANDO: /ayer ========================================
-# =============================================================================
-
-async def cmd_ayer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Resumen del día anterior"""
-    telegram_id = str(update.effective_user.id)
-    db = SessionLocal()
-    
-    try:
-        user = require_user(telegram_id, db)
-        yesterday = date.today() - timedelta(days=1)
-        
-        habits = db.query(Habit).filter(
-            Habit.user_id == user.id, Habit.active == True
-        ).all()
-        applicable = [h for h in habits if habit_applies_today(h, yesterday)]
-        logs = db.query(HabitLog).filter(
-            HabitLog.user_id == user.id, HabitLog.date == yesterday
-        ).all()
-        log_map = {l.habit_id: l for l in logs}
-        
-        completed = sum(1 for h in applicable if log_map.get(h.id) and log_map[h.id].completed)
-        total = len(applicable)
-        pct = round(completed / total * 100) if total > 0 else 0
-        
-        lines = [f"📅 *Ayer* {color_emoji(pct)}\n"]
-        lines.append(f"{progress_bar(completed, total)}\n")
-        
-        for habit in applicable:
-            log = log_map.get(habit.id)
-            done = log and log.completed
-            status = "✅" if done else "❌"
-            lines.append(f"{status} {habit.icon} {habit.name}")
-        
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
-
-
-# =============================================================================
-# ===================== COMANDO: /rutinas, /morning, /night ===================
-# =============================================================================
-
-async def cmd_rutinas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lista todas las rutinas del usuario"""
-    telegram_id = str(update.effective_user.id)
-    db = SessionLocal()
-    
-    try:
-        user = require_user(telegram_id, db)
-        routines = db.query(Routine).filter(
-            Routine.user_id == user.id, Routine.active == True
-        ).order_by(Routine.order).all()
-        
-        if not routines:
-            await update.message.reply_text(
-                "No tiene rutinas configuradas\\. Créelas desde la web\\.",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
-            return
-        
-        keyboard = []
-        for r in routines:
-            keyboard.append([InlineKeyboardButton(
-                f"{r.icon} {r.name}",
-                callback_data=f"routine_{r.id}"
-            )])
-        
-        await update.message.reply_text(
-            "📋 *Sus rutinas:*",
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
-
-
-async def cmd_morning(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra la primera rutina con 'mañana' o 'morning' en el nombre, o la primera rutina"""
-    await _show_routine_by_keyword(update, ["mañana", "morning", "morn"])
-
-
-async def cmd_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra la primera rutina con 'noche' o 'night' en el nombre"""
-    await _show_routine_by_keyword(update, ["noche", "night", "nocturna"])
-
-
-async def _show_routine_by_keyword(update: Update, keywords: list[str]):
-    """Helper para buscar rutina por palabra clave"""
-    telegram_id = str(update.effective_user.id)
-    db = SessionLocal()
-    
-    try:
-        user = require_user(telegram_id, db)
-        routines = db.query(Routine).filter(
-            Routine.user_id == user.id, Routine.active == True
-        ).all()
-        
-        # Buscar rutina que coincida
-        routine = None
-        for r in routines:
-            if any(kw in r.name.lower() for kw in keywords):
-                routine = r
-                break
-        
-        if not routine and routines:
-            routine = routines[0]
-        
-        if not routine:
-            await update.message.reply_text(
-                "No tiene rutinas configuradas\\. Créelas desde la web\\.",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
-            return
-        
-        await _send_routine(update, routine, db)
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
-
-
-async def _send_routine(update_or_query, routine: Routine, db: Session):
-    """Envía una rutina formateada"""
-    steps = db.query(RoutineStep).filter(
-        RoutineStep.routine_id == routine.id
-    ).order_by(RoutineStep.step_order).all()
-    
-    total_time = sum(s.duration_minutes or 0 for s in steps)
-    
-    lines = [f"{routine.icon} *{routine.name}*"]
-    if total_time > 0:
-        lines.append(f"⏱ Tiempo estimado: {total_time} min\n")
+def _incr(db, u, hid, today):
+    h = db.query(Habit).filter(Habit.id==hid, Habit.user_id==u.id).first()
+    if not h: return
+    lg = db.query(HabitLog).filter(HabitLog.habit_id==hid, HabitLog.date==today).first()
+    if lg:
+        lg.quantity_logged += 1
+        if h.target_quantity and lg.quantity_logged >= h.target_quantity: lg.completed=True; lg.completed_at=datetime.utcnow()
     else:
-        lines.append("")
-    
-    for step in steps:
-        time_str = f" \\({step.duration_minutes} min\\)" if step.duration_minutes else ""
-        lines.append(f"{step.step_order}\\. {step.description}{time_str}")
-    
-    lines.append(f"\n💪 ¡A por ello\\!")
-    
-    # Determinar dónde enviar
-    if hasattr(update_or_query, 'message') and update_or_query.message:
-        await update_or_query.message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2
-        )
-    elif hasattr(update_or_query, 'edit_message_text'):
-        await update_or_query.edit_message_text(
-            "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2
-        )
+        ic = h.target_quantity and 1 >= h.target_quantity
+        lg = HabitLog(user_id=u.id,habit_id=hid,date=today,quantity_logged=1,completed=ic,completed_at=datetime.utcnow() if ic else None); db.add(lg)
+    db.commit()
+    if lg.completed: update_habit_streak(db,h,True,today); update_global_streak(db,u,today); award_xp(db,u,"habit_complete",h.current_streak)
 
 
-async def callback_routine(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback para botones de rutinas"""
-    query = update.callback_query
-    await query.answer()
-    
-    routine_id = int(query.data.replace("routine_", ""))
+# ── /pendiente ──
+async def cmd_pendiente(upd, ctx):
+    tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        routine = db.query(Routine).filter(Routine.id == routine_id).first()
-        if routine:
-            await _send_routine(query, routine, db)
-    finally:
-        db.close()
+        u = require_user(tid, db); today = date.today()
+        habits = db.query(Habit).filter(Habit.user_id==u.id, Habit.active==True, Habit.archived==False).order_by(Habit.order).all()
+        applicable = [h for h in habits if habit_applies_today(h, today)]
+        done_ids = {l.habit_id for l in db.query(HabitLog).filter(HabitLog.user_id==u.id, HabitLog.date==today, HabitLog.completed==True).all()}
+        pending = [h for h in applicable if h.id not in done_ids]
+        if not pending: await reply(upd, f"✅ <b>¡Todo completado!</b> {motiv(u.global_streak)}"); return
+        lines = [f"⏳ <b>Pendientes</b> ({len(pending)})\n"]
+        kb = []
+        for h in pending:
+            lines.append(f"⬜ {h.icon} {h.name}")
+            kb.append([InlineKeyboardButton(f"✅ {h.icon} {h.name}", callback_data=f"habit_do_{h.id}")])
+        await reply(upd, "\n".join(lines), InlineKeyboardMarkup(kb))
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
 
 
-# =============================================================================
-# ===================== COMANDO: /racha =======================================
-# =============================================================================
-
-async def cmd_racha(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
+# ── /hoy ──
+async def cmd_hoy(upd, ctx):
+    tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        user = require_user(telegram_id, db)
-        habits = db.query(Habit).filter(
-            Habit.user_id == user.id, Habit.active == True, Habit.archived == False
-        ).order_by(Habit.current_streak.desc()).all()
-        
-        lines = [
-            "🔥 *Rachas actuales*\n",
-            f"🌐 *Global:* {user.global_streak} días \\(mejor: {user.best_global_streak}\\)\n",
-        ]
-        
-        for h in habits:
-            fire = "🔥" if h.current_streak >= 7 else "🌱" if h.current_streak >= 3 else "·"
-            lines.append(f"{fire} {h.icon} {h.name}: {h.current_streak} días \\(mejor: {h.best_streak}\\)")
-        
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+        u = require_user(tid, db); today = date.today()
+        habits = db.query(Habit).filter(Habit.user_id==u.id, Habit.active==True, Habit.archived==False).all()
+        app = [h for h in habits if habit_applies_today(h, today)]
+        done = len(db.query(HabitLog).filter(HabitLog.user_id==u.id, HabitLog.date==today, HabitLog.completed==True).all())
+        tot = len(app); pct = round(done/tot*100) if tot else 0
+        w = db.query(WaterLog).filter(WaterLog.user_id==u.id, WaterLog.date==today).first()
+        m = db.query(MoodLog).filter(MoodLog.user_id==u.id, MoodLog.date==today).first()
+        pt = db.query(Task).filter(Task.user_id==u.id, Task.completed==False).count()
+        lines = [f"{greeting()}! 📊\n", f"<b>Hábitos:</b> {done}/{tot} {color_emoji(pct)}", progress_bar(done,tot),
+                 f"\n💧 <b>Agua:</b> {w.glasses if w else 0}/8 vasos"]
+        if m: lines.append(f"😊 <b>Ánimo:</b> {mood_emoji(m.level)} ({m.level}/5)")
+        if pt: lines.append(f"📝 <b>Tareas:</b> {pt}")
+        lines += [f"\n🔥 <b>Racha:</b> {u.global_streak} días", f"⚡ <b>Nivel:</b> {u.level} ({get_level_title(u.level)})"]
+        await reply(upd, "\n".join(lines))
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
 
 
-# =============================================================================
-# ===================== COMANDO: /nivel =======================================
-# =============================================================================
-
-async def cmd_nivel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
+# ── /ayer ──
+async def cmd_ayer(upd, ctx):
+    tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        user = require_user(telegram_id, db)
-        info = get_level_info(user)
-        
-        await update.message.reply_text(
-            f"⚡ *Nivel {info['level']}* — {info['title']}\n\n"
-            f"XP: {info['xp_in_level']}/{info['xp_next_level']}\n"
-            f"{progress_bar(info['xp_in_level'], info['xp_next_level'])}\n\n"
-            f"XP total: {info['xp']}",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+        u = require_user(tid, db); yday = date.today()-timedelta(days=1)
+        habits = db.query(Habit).filter(Habit.user_id==u.id, Habit.active==True).all()
+        app = [h for h in habits if habit_applies_today(h, yday)]
+        logs = db.query(HabitLog).filter(HabitLog.user_id==u.id, HabitLog.date==yday).all()
+        lm = {l.habit_id:l for l in logs}
+        done = sum(1 for h in app if lm.get(h.id) and lm[h.id].completed)
+        pct = round(done/len(app)*100) if app else 0
+        lines = [f"📅 <b>Ayer</b> {color_emoji(pct)}\n", progress_bar(done,len(app))+"\n"]
+        for h in app:
+            lg = lm.get(h.id); d = lg and lg.completed
+            lines.append(f"{'✅' if d else '❌'} {h.icon} {h.name}")
+        await reply(upd, "\n".join(lines))
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
 
 
-# =============================================================================
-# ===================== COMANDO: /logros ======================================
-# =============================================================================
-
-async def cmd_logros(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
+# ── /rutinas, /morning, /night ──
+async def cmd_rutinas(upd, ctx):
+    tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        user = require_user(telegram_id, db)
-        all_achievements = db.query(Achievement).all()
-        unlocked = db.query(UserAchievement).filter(
-            UserAchievement.user_id == user.id
-        ).all()
-        unlocked_ids = {ua.achievement_id for ua in unlocked}
-        
-        total = len(all_achievements)
-        done = len(unlocked_ids)
-        
-        lines = [f"🏆 *Logros* \\({done}/{total}\\)\n"]
-        
-        for ach in all_achievements:
-            if ach.id in unlocked_ids:
-                lines.append(f"  {ach.icon} *{ach.name}*")
-            else:
-                lines.append(f"  🔒 _{ach.name}_")
-        
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+        u = require_user(tid, db)
+        rs = db.query(Routine).filter(Routine.user_id==u.id, Routine.active==True).order_by(Routine.order).all()
+        if not rs: await reply(upd, "No tiene rutinas."); return
+        kb = [[InlineKeyboardButton(f"{r.icon} {r.name}", callback_data=f"routine_{r.id}")] for r in rs]
+        await reply(upd, "📋 <b>Sus rutinas:</b>", InlineKeyboardMarkup(kb))
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
 
+async def cmd_morning(upd, ctx): await _routine_kw(upd, ["mañana","morning"])
+async def cmd_night(upd, ctx): await _routine_kw(upd, ["noche","night"])
 
-# =============================================================================
-# ===================== COMANDO: /semana ======================================
-# =============================================================================
-
-async def cmd_semana(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
+async def _routine_kw(upd, kws):
+    tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        user = require_user(telegram_id, db)
-        today = date.today()
-        monday = today - timedelta(days=today.weekday())
-        
-        day_names = ["L", "M", "X", "J", "V", "S", "D"]
-        lines = ["📊 *Resumen semanal*\n"]
-        
-        total_completed = 0
-        total_habits = 0
-        
+        u = require_user(tid, db)
+        rs = db.query(Routine).filter(Routine.user_id==u.id, Routine.active==True).all()
+        r = next((r for r in rs if any(k in r.name.lower() for k in kws)), rs[0] if rs else None)
+        if not r: await reply(upd, "No tiene rutinas."); return
+        await _send_routine(upd, r, db)
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
+
+async def _send_routine(target, r, db):
+    steps = db.query(RoutineStep).filter(RoutineStep.routine_id==r.id).order_by(RoutineStep.step_order).all()
+    tt = sum(s.duration_minutes or 0 for s in steps)
+    lines = [f"{r.icon} <b>{r.name}</b>"]
+    if tt: lines.append(f"⏱ {tt} min\n")
+    else: lines.append("")
+    for s in steps:
+        t = f" ({s.duration_minutes} min)" if s.duration_minutes else ""
+        lines.append(f"{s.step_order}. {s.description}{t}")
+    lines.append("\n💪 ¡A por ello!")
+    text = "\n".join(lines)
+    if hasattr(target,'message') and target.message: await target.message.reply_text(text, parse_mode=HTML)
+    elif hasattr(target,'edit_message_text'): await target.edit_message_text(text, parse_mode=HTML)
+
+async def callback_routine(upd, ctx):
+    q = upd.callback_query; await q.answer()
+    rid = int(q.data.replace("routine_",""))
+    db = SessionLocal()
+    try:
+        r = db.query(Routine).filter(Routine.id==rid).first()
+        if r: await _send_routine(q, r, db)
+    finally: db.close()
+
+
+# ── /racha ──
+async def cmd_racha(upd, ctx):
+    tid = str(upd.effective_user.id)
+    db = SessionLocal()
+    try:
+        u = require_user(tid, db)
+        hs = db.query(Habit).filter(Habit.user_id==u.id, Habit.active==True, Habit.archived==False).order_by(Habit.current_streak.desc()).all()
+        lines = ["🔥 <b>Rachas</b>\n", f"🌐 <b>Global:</b> {u.global_streak} días (mejor: {u.best_global_streak})\n"]
+        for h in hs:
+            f = "🔥" if h.current_streak>=7 else "🌱" if h.current_streak>=3 else "·"
+            lines.append(f"{f} {h.icon} {h.name}: {h.current_streak} (mejor: {h.best_streak})")
+        await reply(upd, "\n".join(lines))
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
+
+
+# ── /nivel ──
+async def cmd_nivel(upd, ctx):
+    tid = str(upd.effective_user.id)
+    db = SessionLocal()
+    try:
+        u = require_user(tid, db); i = get_level_info(u)
+        await reply(upd, f"⚡ <b>Nivel {i['level']}</b> — {i['title']}\n\nXP: {i['xp_in_level']}/{i['xp_next_level']}\n{progress_bar(i['xp_in_level'],i['xp_next_level'])}\n\nXP total: {i['xp']}")
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
+
+
+# ── /logros ──
+async def cmd_logros(upd, ctx):
+    tid = str(upd.effective_user.id)
+    db = SessionLocal()
+    try:
+        u = require_user(tid, db)
+        aa = db.query(Achievement).all()
+        ui = {ua.achievement_id for ua in db.query(UserAchievement).filter(UserAchievement.user_id==u.id).all()}
+        lines = [f"🏆 <b>Logros</b> ({len(ui)}/{len(aa)})\n"]
+        for a in aa:
+            if a.id in ui: lines.append(f"  {a.icon} <b>{a.name}</b>")
+            else: lines.append(f"  🔒 <i>{a.name}</i>")
+        await reply(upd, "\n".join(lines))
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
+
+
+# ── /semana ──
+async def cmd_semana(upd, ctx):
+    tid = str(upd.effective_user.id)
+    db = SessionLocal()
+    try:
+        u = require_user(tid, db); today = date.today(); mon = today-timedelta(days=today.weekday())
+        dn = ["L","M","X","J","V","S","D"]; lines = ["📊 <b>Semana</b>\n"]; tc=0; th=0
         for i in range(7):
-            day = monday + timedelta(days=i)
-            habits = db.query(Habit).filter(
-                Habit.user_id == user.id, Habit.active == True, Habit.archived == False
-            ).all()
-            applicable = [h for h in habits if habit_applies_today(h, day)]
-            logs = db.query(HabitLog).filter(
-                HabitLog.user_id == user.id, HabitLog.date == day, HabitLog.completed == True
-            ).all()
-            
-            done = len(logs)
-            total = len(applicable)
-            total_completed += done
-            total_habits += total
-            
-            pct = round(done / total * 100) if total > 0 else 0
-            marker = "📍" if day == today else " "
-            check = "✅" if done == total and total > 0 else "❌" if total > 0 else "·"
-            
-            lines.append(f"{marker}{day_names[i]} {check} {done}/{total} {progress_bar(done, total, 6)}")
-        
-        week_pct = round(total_completed / total_habits * 100) if total_habits > 0 else 0
-        lines.append(f"\n*Total:* {total_completed}/{total_habits} {color_emoji(week_pct)}")
-        
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+            day = mon+timedelta(days=i)
+            hs = db.query(Habit).filter(Habit.user_id==u.id, Habit.active==True, Habit.archived==False).all()
+            ap = [h for h in hs if habit_applies_today(h,day)]
+            ls = db.query(HabitLog).filter(HabitLog.user_id==u.id, HabitLog.date==day, HabitLog.completed==True).all()
+            d=len(ls); t=len(ap); tc+=d; th+=t
+            mk = "📍" if day==today else " "
+            ck = "✅" if d==t and t>0 else "❌" if t>0 else "·"
+            lines.append(f"{mk}{dn[i]} {ck} {d}/{t} {progress_bar(d,t,6)}")
+        wp = round(tc/th*100) if th else 0
+        lines.append(f"\n<b>Total:</b> {tc}/{th} {color_emoji(wp)}")
+        await reply(upd, "\n".join(lines))
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
 
 
-# =============================================================================
-# ===================== COMANDO: /calendario ==================================
-# =============================================================================
-
-async def cmd_calendario(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mapa de calor del mes actual estilo GitHub"""
-    telegram_id = str(update.effective_user.id)
+# ── /calendario ──
+async def cmd_calendario(upd, ctx):
+    tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        user = require_user(telegram_id, db)
-        today = date.today()
-        first_day = today.replace(day=1)
-        
-        # Obtener todos los logs del mes
-        logs = db.query(HabitLog).filter(
-            HabitLog.user_id == user.id,
-            HabitLog.date >= first_day,
-            HabitLog.completed == True
-        ).all()
-        
-        habits = db.query(Habit).filter(
-            Habit.user_id == user.id, Habit.active == True, Habit.archived == False
-        ).all()
-        
-        # Calcular completado por día
-        lines = [f"📅 *{today.strftime('%B %Y')}*\n"]
-        lines.append("L  M  X  J  V  S  D")
-        
-        # Padding para el primer día
-        first_weekday = first_day.weekday()
-        row = "   " * first_weekday
-        
-        day = first_day
+        u = require_user(tid, db); today = date.today(); fd = today.replace(day=1)
+        logs = db.query(HabitLog).filter(HabitLog.user_id==u.id, HabitLog.date>=fd, HabitLog.completed==True).all()
+        hs = db.query(Habit).filter(Habit.user_id==u.id, Habit.active==True, Habit.archived==False).all()
+        lines = [f"📅 <b>{today.strftime('%B %Y')}</b>\n", "L  M  X  J  V  S  D"]
+        row = "   " * fd.weekday(); day = fd
         while day.month == today.month:
-            applicable = [h for h in habits if habit_applies_today(h, day)]
-            day_logs = [l for l in logs if l.date == day]
-            
-            if day > today:
-                cell = "· "
-            elif len(applicable) == 0:
-                cell = "· "
-            elif len(day_logs) >= len(applicable):
-                cell = "✅"
-            elif len(day_logs) > 0:
-                cell = "🟡"
-            else:
-                cell = "❌"
-            
-            row += cell + " "
-            
-            if day.weekday() == 6:  # Domingo
-                lines.append(row.rstrip())
-                row = ""
-            
+            ap = [h for h in hs if habit_applies_today(h, day)]
+            dl = [l for l in logs if l.date==day]
+            if day>today: c="· "
+            elif not ap: c="· "
+            elif len(dl)>=len(ap): c="✅"
+            elif dl: c="🟡"
+            else: c="❌"
+            row += c+" "
+            if day.weekday()==6: lines.append(row.rstrip()); row=""
             day += timedelta(days=1)
-        
-        if row.strip():
-            lines.append(row.rstrip())
-        
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+        if row.strip(): lines.append(row.rstrip())
+        await reply(upd, "\n".join(lines))
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
 
 
-# =============================================================================
-# ===================== COMANDO: /mood ========================================
-# =============================================================================
+# ── /mood ──
+async def cmd_mood(upd, ctx):
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("😢 1",callback_data="mood_1"), InlineKeyboardButton("😞 2",callback_data="mood_2"),
+        InlineKeyboardButton("😐 3",callback_data="mood_3"), InlineKeyboardButton("🙂 4",callback_data="mood_4"),
+        InlineKeyboardButton("🤩 5",callback_data="mood_5")]])
+    await reply(upd, "¿Cómo se siente hoy?", kb)
 
-async def cmd_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Pregunta el estado de ánimo con botones"""
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("😢 1", callback_data="mood_1"),
-            InlineKeyboardButton("😞 2", callback_data="mood_2"),
-            InlineKeyboardButton("😐 3", callback_data="mood_3"),
-            InlineKeyboardButton("🙂 4", callback_data="mood_4"),
-            InlineKeyboardButton("🤩 5", callback_data="mood_5"),
-        ]
-    ])
-    
-    await update.message.reply_text(
-        "¿Cómo se siente hoy?",
-        reply_markup=keyboard
-    )
-
-
-async def callback_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Registra el mood seleccionado"""
-    query = update.callback_query
-    await query.answer()
-    
-    level = int(query.data.replace("mood_", ""))
-    telegram_id = str(update.effective_user.id)
+async def callback_mood(upd, ctx):
+    q = upd.callback_query; await q.answer()
+    lv = int(q.data.replace("mood_","")); tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        user = require_user(telegram_id, db)
-        today = date.today()
-        
-        existing = db.query(MoodLog).filter(
-            MoodLog.user_id == user.id, MoodLog.date == today
-        ).first()
-        
-        if existing:
-            existing.level = level
-        else:
-            db.add(MoodLog(user_id=user.id, date=today, level=level))
-            award_xp(db, user, "mood_log")
-        
+        u = require_user(tid, db); today = date.today()
+        ex = db.query(MoodLog).filter(MoodLog.user_id==u.id, MoodLog.date==today).first()
+        if ex: ex.level=lv
+        else: db.add(MoodLog(user_id=u.id,date=today,level=lv)); award_xp(db,u,"mood_log")
         db.commit()
-        
-        await query.edit_message_text(
-            f"Registrado: {mood_emoji(level)} \\({level}/5\\)\n\n"
-            f"¡Gracias por registrar su ánimo\\!",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    
-    except ValueError:
-        await query.edit_message_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+        await edit(q, f"Registrado: {mood_emoji(lv)} ({lv}/5)\n\n¡Gracias!")
+    except ValueError: await edit(q, NOT_LINKED)
+    finally: db.close()
 
 
-# =============================================================================
-# ===================== COMANDO: /agua ========================================
-# =============================================================================
-
-async def cmd_agua(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Añade un vaso de agua"""
-    telegram_id = str(update.effective_user.id)
+# ── /agua ──
+async def cmd_agua(upd, ctx):
+    tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        user = require_user(telegram_id, db)
-        today = date.today()
-        
-        log = db.query(WaterLog).filter(
-            WaterLog.user_id == user.id, WaterLog.date == today
-        ).first()
-        
-        if log:
-            log.glasses += 1
-        else:
-            log = WaterLog(user_id=user.id, date=today, glasses=1)
-            db.add(log)
-        
-        db.commit()
-        db.refresh(log)
-        
-        bar = progress_bar(log.glasses, log.target)
-        emoji = "🎉" if log.glasses >= log.target else "💧"
-        
-        await update.message.reply_text(
-            f"{emoji} *Agua:* {log.glasses}/{log.target} vasos\n{bar}",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+        u = require_user(tid, db); today = date.today()
+        lg = db.query(WaterLog).filter(WaterLog.user_id==u.id, WaterLog.date==today).first()
+        if lg: lg.glasses+=1
+        else: lg=WaterLog(user_id=u.id,date=today,glasses=1); db.add(lg)
+        db.commit(); db.refresh(lg)
+        e = "🎉" if lg.glasses>=lg.target else "💧"
+        await reply(upd, f"{e} <b>Agua:</b> {lg.glasses}/{lg.target} vasos\n{progress_bar(lg.glasses,lg.target)}")
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
 
 
-# =============================================================================
-# ===================== COMANDO: /sueno =======================================
-# =============================================================================
+# ── /sueno ──
+async def cmd_sueno(upd, ctx):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("5h",callback_data="sleep_5"),InlineKeyboardButton("6h",callback_data="sleep_6"),
+         InlineKeyboardButton("6.5h",callback_data="sleep_6.5"),InlineKeyboardButton("7h",callback_data="sleep_7")],
+        [InlineKeyboardButton("7.5h",callback_data="sleep_7.5"),InlineKeyboardButton("8h",callback_data="sleep_8"),
+         InlineKeyboardButton("8.5h",callback_data="sleep_8.5"),InlineKeyboardButton("9h+",callback_data="sleep_9")]])
+    await reply(upd, "🛌 ¿Cuántas horas durmió?", kb)
 
-async def cmd_sueno(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Registra horas de sueño con botones"""
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("5h", callback_data="sleep_5"),
-            InlineKeyboardButton("6h", callback_data="sleep_6"),
-            InlineKeyboardButton("6.5h", callback_data="sleep_6.5"),
-            InlineKeyboardButton("7h", callback_data="sleep_7"),
-        ],
-        [
-            InlineKeyboardButton("7.5h", callback_data="sleep_7.5"),
-            InlineKeyboardButton("8h", callback_data="sleep_8"),
-            InlineKeyboardButton("8.5h", callback_data="sleep_8.5"),
-            InlineKeyboardButton("9h+", callback_data="sleep_9"),
-        ],
-    ])
-    
-    await update.message.reply_text(
-        "🛌 ¿Cuántas horas durmió anoche?",
-        reply_markup=keyboard
-    )
-
-
-async def callback_sleep(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    hours = float(query.data.replace("sleep_", ""))
-    telegram_id = str(update.effective_user.id)
+async def callback_sleep(upd, ctx):
+    q = upd.callback_query; await q.answer()
+    hrs = float(q.data.replace("sleep_","")); tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        user = require_user(telegram_id, db)
-        today = date.today()
-        
-        existing = db.query(SleepLog).filter(
-            SleepLog.user_id == user.id, SleepLog.date == today
-        ).first()
-        
-        if existing:
-            existing.hours = hours
-        else:
-            db.add(SleepLog(user_id=user.id, date=today, hours=hours))
-            award_xp(db, user, "sleep_log")
-        
+        u = require_user(tid, db); today = date.today()
+        ex = db.query(SleepLog).filter(SleepLog.user_id==u.id, SleepLog.date==today).first()
+        if ex: ex.hours=hrs
+        else: db.add(SleepLog(user_id=u.id,date=today,hours=hrs)); award_xp(db,u,"sleep_log")
         db.commit()
-        
-        emoji = "😴" if hours >= 7 else "⚠️"
-        await query.edit_message_text(
-            f"{emoji} Registrado: {hours}h de sueño",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    
-    except ValueError:
-        await query.edit_message_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+        await edit(q, f"{'😴' if hrs>=7 else '⚠️'} Registrado: {hrs}h de sueño")
+    except ValueError: await edit(q, NOT_LINKED)
+    finally: db.close()
 
 
-# =============================================================================
-# ===================== COMANDO: /nota ========================================
-# =============================================================================
-# Usa ConversationHandler para pedir el texto
-
+# ── /nota ──
 NOTE_TEXT = 0
+async def cmd_nota(upd, ctx):
+    await reply(upd, "✍️ Escriba su nota:"); return NOTE_TEXT
 
-async def cmd_nota(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✍️ Escriba su nota del diario:")
-    return NOTE_TEXT
-
-
-async def nota_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
+async def nota_text(upd, ctx):
+    tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        user = require_user(telegram_id, db)
-        today = date.today()
-        
-        entry = JournalEntry(
-            user_id=user.id, date=today, content=update.message.text
-        )
-        db.add(entry)
-        award_xp(db, user, "journal_entry")
-        db.commit()
-        
-        await update.message.reply_text(
-            "✅ Nota guardada en su diario\\.",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
-    
+        u = require_user(tid, db)
+        db.add(JournalEntry(user_id=u.id, date=date.today(), content=upd.message.text))
+        award_xp(db,u,"journal_entry"); db.commit()
+        await reply(upd, "✅ Nota guardada.")
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
     return ConversationHandler.END
 
 
-# =============================================================================
-# ===================== COMANDO: /inspiracion =================================
-# =============================================================================
-
-async def cmd_inspiracion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── /inspiracion ──
+async def cmd_inspiracion(upd, ctx):
     db = SessionLocal()
     try:
-        quote = get_random_quote(db)
-        author = f"\n— _{quote['author']}_" if quote['author'] else ""
-        await update.message.reply_text(
-            f"💡 *Inspiración*\n\n_{quote['text']}_\n{author}",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    finally:
-        db.close()
+        q = get_random_quote(db)
+        a = f"\n— <i>{q['author']}</i>" if q.get('author') else ""
+        await reply(upd, f"💡 <b>Inspiración</b>\n\n<i>{q['text']}</i>{a}")
+    finally: db.close()
 
 
-# =============================================================================
-# ===================== COMANDO: /tareas ======================================
-# =============================================================================
-
-async def cmd_tareas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lista tareas pendientes"""
-    telegram_id = str(update.effective_user.id)
+# ── /tareas ──
+async def cmd_tareas(upd, ctx):
+    tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        user = require_user(telegram_id, db)
-        tasks = db.query(Task).filter(
-            Task.user_id == user.id, Task.completed == False
-        ).order_by(Task.due_date.asc().nullslast()).limit(10).all()
-        
-        if not tasks:
-            await update.message.reply_text(
-                "✅ No tiene tareas pendientes\\. ¡Bien hecho\\!",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
-            return
-        
-        priority_icons = {"urgent": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
-        
-        lines = [f"📝 *Tareas pendientes* \\({len(tasks)}\\)\n"]
-        keyboard = []
-        
-        for t in tasks:
-            icon = priority_icons.get(t.priority, "⚪")
-            due = f" \\(vence: {t.due_date}\\)" if t.due_date else ""
-            lines.append(f"{icon} {t.title}{due}")
-            keyboard.append([InlineKeyboardButton(
-                f"✅ {t.title}", callback_data=f"task_done_{t.id}"
-            )])
-        
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+        u = require_user(tid, db)
+        ts = db.query(Task).filter(Task.user_id==u.id, Task.completed==False).order_by(Task.due_date.asc().nullslast()).limit(10).all()
+        if not ts: await reply(upd, "✅ Sin tareas pendientes."); return
+        pi = {"urgent":"🔴","high":"🟠","medium":"🟡","low":"🟢"}
+        lines = [f"📝 <b>Tareas</b> ({len(ts)})\n"]
+        kb = []
+        for t in ts:
+            due = f" (vence: {t.due_date})" if t.due_date else ""
+            lines.append(f"{pi.get(t.priority,'⚪')} {t.title}{due}")
+            kb.append([InlineKeyboardButton(f"✅ {t.title}", callback_data=f"task_done_{t.id}")])
+        await reply(upd, "\n".join(lines), InlineKeyboardMarkup(kb))
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
 
-
-async def callback_task_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Marca tarea como completada"""
-    query = update.callback_query
-    await query.answer()
-    
-    task_id = int(query.data.replace("task_done_", ""))
-    telegram_id = str(update.effective_user.id)
+async def callback_task_done(upd, ctx):
+    q = upd.callback_query; await q.answer()
+    tid_task = int(q.data.replace("task_done_","")); tid = str(upd.effective_user.id)
     db = SessionLocal()
-    
     try:
-        user = require_user(telegram_id, db)
-        task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
-        
-        if task:
-            task.completed = True
-            task.completed_at = datetime.utcnow()
-            award_xp(db, user, "task_complete")
+        u = require_user(tid, db)
+        t = db.query(Task).filter(Task.id==tid_task, Task.user_id==u.id).first()
+        if t: t.completed=True; t.completed_at=datetime.utcnow(); award_xp(db,u,"task_complete"); db.commit(); await edit(q, f"✅ <b>{t.title}</b> completada")
+    except ValueError: await edit(q, NOT_LINKED)
+    finally: db.close()
+
+
+# ── /pomodoro ──
+async def cmd_pomodoro(upd, ctx):
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("15 min",callback_data="pomo_15"),InlineKeyboardButton("25 min",callback_data="pomo_25"),InlineKeyboardButton("45 min",callback_data="pomo_45")]])
+    await reply(upd, "🍅 <b>Pomodoro</b>\n\n¿Cuánto tiempo?", kb)
+
+async def callback_pomodoro(upd, ctx):
+    q = upd.callback_query; await q.answer()
+    mins = int(q.data.replace("pomo_","")); tid = str(upd.effective_user.id)
+    db = SessionLocal()
+    try:
+        u = require_user(tid, db)
+        s = PomodoroSession(user_id=u.id, date=date.today(), work_minutes=mins, break_minutes=5)
+        db.add(s); db.commit(); db.refresh(s)
+        ctx.job_queue.run_once(_pomo_done, when=mins*60, data={"sid":s.id,"cid":upd.effective_chat.id}, name=f"pomo_{s.id}")
+        await edit(q, f"🍅 <b>Pomodoro: {mins} min</b>\n\nLe aviso cuando termine. ¡Foco!")
+    except ValueError: await edit(q, NOT_LINKED)
+    finally: db.close()
+
+async def _pomo_done(ctx):
+    d = ctx.job.data; db = SessionLocal()
+    try:
+        s = db.query(PomodoroSession).filter(PomodoroSession.id==d["sid"]).first()
+        if s:
+            s.completed=True; s.finished_at=datetime.utcnow()
+            u = db.query(User).filter(User.id==s.user_id).first()
+            if u: award_xp(db,u,"pomodoro_complete")
             db.commit()
-            
-            await query.edit_message_text(
-                f"✅ Tarea completada: *{task.title}*",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
-    
-    except ValueError:
-        await query.edit_message_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+        await ctx.bot.send_message(chat_id=d["cid"], text=f"🍅 <b>¡Pomodoro completado!</b>\n\n{s.work_minutes} min de foco. Descanso de {s.break_minutes} min. ☕", parse_mode=HTML)
+    finally: db.close()
 
 
-# =============================================================================
-# ===================== COMANDO: /pomodoro ====================================
-# =============================================================================
+# ── /pausar, /reanudar, /modo ──
+async def cmd_pausar(upd, ctx):
+    tid = str(upd.effective_user.id); db = SessionLocal()
+    try: u = require_user(tid,db); u.do_not_disturb=True; db.commit(); await reply(upd, "🔇 Recordatorios <b>pausados</b>. /reanudar para reactivar.")
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
 
-async def cmd_pomodoro(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia un timer pomodoro"""
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("15 min", callback_data="pomo_15"),
-            InlineKeyboardButton("25 min", callback_data="pomo_25"),
-            InlineKeyboardButton("45 min", callback_data="pomo_45"),
-        ]
-    ])
-    
-    await update.message.reply_text(
-        "🍅 *Pomodoro*\n\n¿Cuánto tiempo de foco?",
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=keyboard
-    )
+async def cmd_reanudar(upd, ctx):
+    tid = str(upd.effective_user.id); db = SessionLocal()
+    try: u = require_user(tid,db); u.do_not_disturb=False; db.commit(); await reply(upd, "🔔 Recordatorios <b>reactivados</b>.")
+    except ValueError: await reply(upd, NOT_LINKED)
+    finally: db.close()
 
+async def cmd_modo(upd, ctx):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏃 Normal",callback_data="mode_normal")],
+        [InlineKeyboardButton("🏖 Vacaciones",callback_data="mode_vacation")],
+        [InlineKeyboardButton("🤒 Enfermo",callback_data="mode_sick")]])
+    await reply(upd, "⚙️ <b>Cambiar modo:</b>", kb)
 
-async def callback_pomodoro(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    minutes = int(query.data.replace("pomo_", ""))
-    telegram_id = str(update.effective_user.id)
-    db = SessionLocal()
-    
-    try:
-        user = require_user(telegram_id, db)
-        
-        session = PomodoroSession(
-            user_id=user.id, date=date.today(),
-            work_minutes=minutes, break_minutes=5
-        )
-        db.add(session)
-        db.commit()
-        db.refresh(session)
-        
-        # Programar recordatorio cuando termine
-        context.job_queue.run_once(
-            _pomodoro_finished,
-            when=minutes * 60,
-            data={"session_id": session.id, "chat_id": update.effective_chat.id},
-            name=f"pomo_{session.id}"
-        )
-        
-        await query.edit_message_text(
-            f"🍅 *Pomodoro iniciado: {minutes} minutos*\n\n"
-            f"Le avisaré cuando termine\\. ¡A enfocarse\\!",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    
-    except ValueError:
-        await query.edit_message_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
-
-
-async def _pomodoro_finished(context: ContextTypes.DEFAULT_TYPE):
-    """Se ejecuta cuando termina el pomodoro"""
-    data = context.job.data
-    db = SessionLocal()
-    
-    try:
-        session = db.query(PomodoroSession).filter(
-            PomodoroSession.id == data["session_id"]
-        ).first()
-        
-        if session:
-            session.completed = True
-            session.finished_at = datetime.utcnow()
-            
-            user = db.query(User).filter(User.id == session.user_id).first()
-            if user:
-                award_xp(db, user, "pomodoro_complete")
-            
-            db.commit()
-        
-        await context.bot.send_message(
-            chat_id=data["chat_id"],
-            text="🍅 *¡Pomodoro completado\\!*\n\n"
-                 f"Ha estado enfocado {session.work_minutes} minutos\\. "
-                 f"Tómese un descanso de {session.break_minutes} minutos\\. ☕",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    finally:
-        db.close()
-
-
-# =============================================================================
-# ===================== COMANDO: /pausar y /reanudar ==========================
-# =============================================================================
-
-async def cmd_pausar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
+async def callback_mode(upd, ctx):
+    q = upd.callback_query; await q.answer()
+    mode = q.data.replace("mode_",""); tid = str(upd.effective_user.id)
     db = SessionLocal()
     try:
-        user = require_user(telegram_id, db)
-        user.do_not_disturb = True
-        db.commit()
-        await update.message.reply_text(
-            "🔇 Recordatorios *pausados*\\.\nUse /reanudar para reactivarlos\\.",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+        u = require_user(tid,db); u.mode=mode; db.commit()
+        mn = {"normal":"🏃 Normal","vacation":"🏖 Vacaciones","sick":"🤒 Enfermo"}
+        await edit(q, f"Modo: <b>{mn.get(mode,mode)}</b>")
+    except ValueError: await edit(q, NOT_LINKED)
+    finally: db.close()
 
 
-async def cmd_reanudar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
-    db = SessionLocal()
-    try:
-        user = require_user(telegram_id, db)
-        user.do_not_disturb = False
-        db.commit()
-        await update.message.reply_text(
-            "🔔 Recordatorios *reactivados*\\.",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    except ValueError:
-        await update.message.reply_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
+# ── Teclado persistente ──
+async def handle_keyboard(upd, ctx):
+    t = upd.message.text.strip()
+    m = {"📋 Hábitos":cmd_habitos,"📊 Hoy":cmd_hoy,"🌅 Morning":cmd_morning,"🌙 Night":cmd_night,"💧 Agua":cmd_agua,"💡 Inspiración":cmd_inspiracion}
+    h = m.get(t)
+    if h: await h(upd, ctx)
 
 
-# =============================================================================
-# ===================== COMANDO: /modo ========================================
-# =============================================================================
-
-async def cmd_modo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏃 Normal", callback_data="mode_normal")],
-        [InlineKeyboardButton("🏖 Vacaciones (pausa sin perder rachas)", callback_data="mode_vacation")],
-        [InlineKeyboardButton("🤒 Enfermo (hábitos mínimos)", callback_data="mode_sick")],
-    ])
-    
-    await update.message.reply_text(
-        "⚙️ *Cambiar modo*\n\nSeleccione su modo actual:",
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=keyboard
-    )
-
-
-async def callback_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    mode = query.data.replace("mode_", "")
-    telegram_id = str(update.effective_user.id)
-    db = SessionLocal()
-    
-    try:
-        user = require_user(telegram_id, db)
-        user.mode = mode
-        db.commit()
-        
-        mode_names = {"normal": "🏃 Normal", "vacation": "🏖 Vacaciones", "sick": "🤒 Enfermo"}
-        await query.edit_message_text(
-            f"Modo cambiado a: *{mode_names.get(mode, mode)}*",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    
-    except ValueError:
-        await query.edit_message_text(NOT_LINKED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
-    finally:
-        db.close()
-
-
-# =============================================================================
-# ===================== HANDLER: Botones del teclado persistente ==============
-# =============================================================================
-
-async def handle_keyboard_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Redirige los botones del teclado persistente a los comandos"""
-    text = update.message.text.strip()
-    
-    BUTTON_MAP = {
-        "📋 Hábitos": cmd_habitos,
-        "📊 Hoy": cmd_hoy,
-        "🌅 Morning": cmd_morning,
-        "🌙 Night": cmd_night,
-        "💧 Agua": cmd_agua,
-        "💡 Inspiración": cmd_inspiracion,
-    }
-    
-    handler = BUTTON_MAP.get(text)
-    if handler:
-        await handler(update, context)
-
-
-# =============================================================================
-# ===================== CONFIGURAR Y ARRANCAR BOT =============================
-# =============================================================================
-
-def create_bot_application() -> Application:
-    """
-    Crea y configura la aplicación del bot con todos los handlers.
-    Se llama desde main.py en el lifespan.
-    """
+# ── Setup ──
+def create_bot_application():
     if not BOT_TOKEN:
-        logger.warning("⚠️ TELEGRAM_BOT_TOKEN no configurado. Bot deshabilitado.")
+        logger.warning("⚠️ Sin TELEGRAM_BOT_TOKEN. Bot deshabilitado.")
         return None
-    
     app = Application.builder().token(BOT_TOKEN).build()
-    
-    # ── Conversación: Login ──
-    login_conv = ConversationHandler(
+
+    app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("login", cmd_login)],
-        states={
-            LOGIN_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_email)],
-            LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
-        },
-        fallbacks=[CommandHandler("cancel", login_cancel)],
-    )
-    
-    # ── Conversación: Nota ──
-    nota_conv = ConversationHandler(
+        states={LOGIN_EMAIL:[MessageHandler(filters.TEXT & ~filters.COMMAND, login_email)], LOGIN_PASSWORD:[MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)]},
+        fallbacks=[CommandHandler("cancel", login_cancel)]))
+    app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("nota", cmd_nota)],
-        states={
-            NOTE_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, nota_text)],
-        },
-        fallbacks=[CommandHandler("cancel", login_cancel)],
-    )
-    
-    # ── Registrar handlers ──
-    app.add_handler(login_conv)
-    app.add_handler(nota_conv)
-    
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("habitos", cmd_habitos))
-    app.add_handler(CommandHandler("pendiente", cmd_pendiente))
-    app.add_handler(CommandHandler("hoy", cmd_hoy))
-    app.add_handler(CommandHandler("ayer", cmd_ayer))
-    app.add_handler(CommandHandler("morning", cmd_morning))
-    app.add_handler(CommandHandler("night", cmd_night))
-    app.add_handler(CommandHandler("rutinas", cmd_rutinas))
-    app.add_handler(CommandHandler("racha", cmd_racha))
-    app.add_handler(CommandHandler("nivel", cmd_nivel))
-    app.add_handler(CommandHandler("logros", cmd_logros))
-    app.add_handler(CommandHandler("semana", cmd_semana))
-    app.add_handler(CommandHandler("calendario", cmd_calendario))
-    app.add_handler(CommandHandler("mood", cmd_mood))
-    app.add_handler(CommandHandler("agua", cmd_agua))
-    app.add_handler(CommandHandler("sueno", cmd_sueno))
-    app.add_handler(CommandHandler("pomodoro", cmd_pomodoro))
-    app.add_handler(CommandHandler("inspiracion", cmd_inspiracion))
-    app.add_handler(CommandHandler("tareas", cmd_tareas))
-    app.add_handler(CommandHandler("pausar", cmd_pausar))
-    app.add_handler(CommandHandler("reanudar", cmd_reanudar))
-    app.add_handler(CommandHandler("modo", cmd_modo))
-    
-    # ── Callbacks inline ──
-    app.add_handler(CallbackQueryHandler(callback_habit, pattern="^habit_"))
-    app.add_handler(CallbackQueryHandler(callback_mood, pattern="^mood_"))
-    app.add_handler(CallbackQueryHandler(callback_sleep, pattern="^sleep_"))
-    app.add_handler(CallbackQueryHandler(callback_pomodoro, pattern="^pomo_"))
-    app.add_handler(CallbackQueryHandler(callback_task_done, pattern="^task_done_"))
-    app.add_handler(CallbackQueryHandler(callback_routine, pattern="^routine_"))
-    app.add_handler(CallbackQueryHandler(callback_mode, pattern="^mode_"))
-    
-    # ── Botones del teclado persistente ──
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, handle_keyboard_buttons
-    ))
-    
-    logger.info(f"🤖 Bot configurado con {len(app.handlers[0])} handlers")
+        states={NOTE_TEXT:[MessageHandler(filters.TEXT & ~filters.COMMAND, nota_text)]},
+        fallbacks=[CommandHandler("cancel", login_cancel)]))
+
+    for name, fn in [("start",cmd_start),("help",cmd_help),("habitos",cmd_habitos),("pendiente",cmd_pendiente),("hoy",cmd_hoy),("ayer",cmd_ayer),
+                     ("morning",cmd_morning),("night",cmd_night),("rutinas",cmd_rutinas),("racha",cmd_racha),("nivel",cmd_nivel),("logros",cmd_logros),
+                     ("semana",cmd_semana),("calendario",cmd_calendario),("mood",cmd_mood),("agua",cmd_agua),("sueno",cmd_sueno),
+                     ("pomodoro",cmd_pomodoro),("inspiracion",cmd_inspiracion),("tareas",cmd_tareas),("pausar",cmd_pausar),("reanudar",cmd_reanudar),("modo",cmd_modo)]:
+        app.add_handler(CommandHandler(name, fn))
+
+    for pat, fn in [("^habit_",callback_habit),("^mood_",callback_mood),("^sleep_",callback_sleep),("^pomo_",callback_pomodoro),
+                    ("^task_done_",callback_task_done),("^routine_",callback_routine),("^mode_",callback_mode)]:
+        app.add_handler(CallbackQueryHandler(fn, pattern=pat))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_keyboard))
+    logger.info("🤖 Bot configurado")
     return app
 
+async def start_bot(app):
+    await app.initialize(); await app.start(); await app.updater.start_polling(drop_pending_updates=True)
+    logger.info("🤖 Bot arrancado")
 
-async def start_bot(app: Application):
-    """Arranca el bot en modo polling (compatible con hilos secundarios)"""
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    logger.info("🤖 Bot de Telegram arrancado")
-
-
-async def stop_bot(app: Application):
-    """Para el bot limpiamente"""
-    await app.updater.stop()
-    await app.stop()
-    await app.shutdown()
-    logger.info("🤖 Bot de Telegram parado")
+async def stop_bot(app):
+    await app.updater.stop(); await app.stop(); await app.shutdown()
+    logger.info("🤖 Bot parado")
